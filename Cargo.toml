@@ -1,0 +1,40 @@
+[package]
+name = "file_io_bench"
+version = "0.1.0"
+edition = "2021"
+
+
+[features]
+default = ["o_direct"]
+# Page sizes. If page sizes are larger than 256k, pages will be heap allocated to avoid stack overflow.
+# Default is 16KB (defined in page.rs)
+4k_page = []
+8k_page = []
+16k_page = []
+32k_page = []
+64k_page = []
+128k_page = []
+256k_page = ["heap_allocated_page"]
+512k_page = ["heap_allocated_page"]
+1m_page = ["heap_allocated_page"]
+heap_allocated_page = []
+
+stat = []
+
+psync = ["io-uring", "libc"]
+# Async IO only for write
+async_write = ["io-uring", "libc"]
+# Async IO with prefetching
+new_async_write = ["io-uring", "libc"]
+# O_DIRECT
+o_direct = ["libc"]
+
+[dependencies]
+chrono = "0.4.39"
+tempfile = "3.16.0"
+rand = {version = "0.9.0", features = ["small_rng"]}
+serde = { version = "1.0.217", features = ["derive"] }
+lazy_static = { version = "1.4" }
+clap = {version = "4.5.27", features = ["derive"]}
+io-uring = {version = "0.7.4", optional = true}
+libc = {version = "0.2.169", optional = true}
