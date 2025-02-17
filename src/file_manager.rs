@@ -46,6 +46,12 @@ impl std::fmt::Display for FileStats {
     }
 }
 
+impl Default for FileStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileStats {
     pub fn new() -> Self {
         FileStats {
@@ -200,7 +206,7 @@ pub mod o_direct {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
+
     use std::sync::Mutex;
 
     pub struct FileManager {
@@ -253,7 +259,7 @@ pub mod o_direct {
                 let ret = read(
                     fd,
                     page.get_raw_bytes_mut().as_mut_ptr() as *mut c_void,
-                    PAGE_SIZE as usize,
+                    PAGE_SIZE,
                 );
                 if ret != PAGE_SIZE as isize {
                     return Err(std::io::Error::last_os_error());
@@ -276,7 +282,7 @@ pub mod o_direct {
                 let ret = write(
                     fd,
                     page.get_raw_bytes().as_ptr() as *const c_void,
-                    PAGE_SIZE as usize,
+                    PAGE_SIZE,
                 );
                 if ret != PAGE_SIZE as isize {
                     return Err(std::io::Error::last_os_error());
