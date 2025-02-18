@@ -5,11 +5,15 @@ pub type ContainerId = u16;
 #[cfg(not(any(
     feature = "async_write",
     feature = "new_async_write",
-    feature = "o_direct"
+    feature = "psync",
+    feature = "psync_direct"
 )))]
-pub type FileManager = sync_write::FileManager;
-#[cfg(feature = "o_direct")]
-pub type FileManager = o_direct::FileManager;
+pub type FileManager = psync_direct::FileManager;
+
+#[cfg(feature = "psync")]
+pub type FileManager = psync::FileManager;
+#[cfg(feature = "psync_direct")]
+pub type FileManager = psync_direct::FileManager;
 #[cfg(feature = "async_write")]
 pub type FileManager = async_write::FileManager;
 #[cfg(feature = "new_async_write")]
@@ -108,28 +112,23 @@ impl FileStats {
     }
 }
 
-#[cfg(not(any(
-    feature = "psync",
-    feature = "async_write",
-    feature = "new_async_write",
-    feature = "o_direct"
-)))]
-pub mod sync_write {
+pub mod psync {
     use super::{ContainerId, FileStats};
     #[allow(unused_imports)]
     use crate::log;
     use crate::log_trace;
     use crate::page::{Page, PageId, PAGE_SIZE};
+    use libc::{c_void, fsync, pread, pwrite};
     use std::fs::{File, OpenOptions};
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::mem::MaybeUninit;
+    use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Mutex;
 
     pub struct FileManager {
         _path: PathBuf,
-        file: Mutex<File>,
+        _file: File, // When this file is dropped, the file descriptor (file_no) will be invalid.
         stats: FileStats,
+        file_no: i32,
     }
 
     impl FileManager {
@@ -145,74 +144,111 @@ pub mod sync_write {
                 .create(true)
                 .truncate(false)
                 .open(&path)?;
+            let file_no = file.as_raw_fd();
             Ok(FileManager {
                 _path: path,
-                file: Mutex::new(file),
+                _file: file,
                 stats: FileStats::new(),
+                file_no,
             })
         }
 
         pub fn num_pages(&self) -> usize {
-            let file = self.file.lock().unwrap();
-            file.metadata().unwrap().len() as usize / PAGE_SIZE
+            // Allocate uninitialized memory for libc::stat
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+
+            // Call fstat with a pointer to our uninitialized stat buffer
+            let ret = unsafe { libc::fstat(self.file_no, stat.as_mut_ptr()) };
+
+            // Check for errors (fstat returns -1 on failure)
+            if ret == -1 {
+                return 0;
+            }
+
+            // Now that fstat has successfully written to the buffer,
+            // we can assume it is initialized.
+            let stat = unsafe { stat.assume_init() };
+
+            // Use the file size (st_size) from stat, then compute pages.
+            (stat.st_size as usize) / PAGE_SIZE
         }
 
         pub fn get_stats(&self) -> FileStats {
             self.stats.clone()
         }
 
-        #[allow(dead_code)]
         pub fn prefetch_page(&self, _page_id: PageId) -> Result<(), std::io::Error> {
             Ok(())
         }
 
         pub fn read_page(&self, page_id: PageId, page: &mut Page) -> Result<(), std::io::Error> {
-            let mut file = self.file.lock().unwrap();
-            self.stats.inc_buffered_read();
+            self.stats.inc_direct_read();
             log_trace!("Reading page: {} from file: {:?}", page_id, self.path);
-            file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
-            file.read_exact(page.get_raw_bytes_mut())?;
-            assert_eq!(page.get_id(), page_id);
+            unsafe {
+                let ret = pread(
+                    self.file_no,
+                    page.get_raw_bytes_mut().as_mut_ptr() as *mut c_void,
+                    PAGE_SIZE,
+                    page_id as i64 * PAGE_SIZE as i64,
+                );
+                if ret != PAGE_SIZE as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            debug_assert!(page.get_id() == page_id, "Page id mismatch");
             Ok(())
         }
 
         pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<(), std::io::Error> {
-            let mut file = self.file.lock().unwrap();
             self.stats.inc_buffered_write();
-            assert_eq!(page.get_id(), page_id);
-            file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
-            file.write_all(page.get_raw_bytes())?;
+            log_trace!("Writing page: {} to file: {:?}", page_id, self.path);
+            debug_assert!(page.get_id() == page_id, "Page id mismatch");
+            unsafe {
+                let ret = pwrite(
+                    self.file_no,
+                    page.get_raw_bytes().as_ptr() as *const c_void,
+                    PAGE_SIZE,
+                    page_id as i64 * PAGE_SIZE as i64,
+                );
+                if ret != PAGE_SIZE as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         }
 
+        // We have to flush with psync
         pub fn flush(&self) -> Result<(), std::io::Error> {
-            let mut file = self.file.lock().unwrap();
-            log_trace!("Flushing file: {:?}", self.path);
-            file.flush()
+            // Flush the kernel page cache to disk
+            unsafe {
+                let ret = fsync(self.file_no);
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
         }
     }
 }
 
-#[cfg(feature = "o_direct")]
-pub mod o_direct {
+pub mod psync_direct {
     use super::{ContainerId, FileStats};
     #[allow(unused_imports)]
     use crate::log;
     use crate::log_trace;
     use crate::page::{Page, PageId, PAGE_SIZE};
-    use libc::{c_void, read, write, O_DIRECT};
+    use libc::{c_void, pread, pwrite, O_DIRECT};
     use std::fs::{File, OpenOptions};
-    use std::io::{Seek, SeekFrom};
+    use std::mem::MaybeUninit;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
 
-    use std::sync::Mutex;
-
     pub struct FileManager {
         _path: PathBuf,
-        file: Mutex<File>,
+        _file: File, // When this file is dropped, the file descriptor (file_no) will be invalid.
         stats: FileStats,
+        file_no: i32,
     }
 
     impl FileManager {
@@ -229,16 +265,33 @@ pub mod o_direct {
                 .truncate(false)
                 .custom_flags(O_DIRECT)
                 .open(&path)?;
+            let file_no = file.as_raw_fd();
             Ok(FileManager {
                 _path: path,
-                file: Mutex::new(file),
+                _file: file,
                 stats: FileStats::new(),
+                file_no,
             })
         }
 
         pub fn num_pages(&self) -> usize {
-            let guard = self.file.lock().unwrap();
-            guard.metadata().unwrap().len() as usize / PAGE_SIZE
+            // Allocate uninitialized memory for libc::stat
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+
+            // Call fstat with a pointer to our uninitialized stat buffer
+            let ret = unsafe { libc::fstat(self.file_no, stat.as_mut_ptr()) };
+
+            // Check for errors (fstat returns -1 on failure)
+            if ret == -1 {
+                return 0;
+            }
+
+            // Now that fstat has successfully written to the buffer,
+            // we can assume it is initialized.
+            let stat = unsafe { stat.assume_init() };
+
+            // Use the file size (st_size) from stat, then compute pages.
+            (stat.st_size as usize) / PAGE_SIZE
         }
 
         pub fn get_stats(&self) -> FileStats {
@@ -250,14 +303,137 @@ pub mod o_direct {
         }
 
         pub fn read_page(&self, page_id: PageId, page: &mut Page) -> Result<(), std::io::Error> {
-            let mut file = self.file.lock().unwrap();
-            let fd = file.as_raw_fd();
             self.stats.inc_direct_read();
             log_trace!("Reading page: {} from file: {:?}", page_id, self.path);
-            file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
             unsafe {
+                let ret = pread(
+                    self.file_no,
+                    page.get_raw_bytes_mut().as_mut_ptr() as *mut c_void,
+                    PAGE_SIZE,
+                    page_id as i64 * PAGE_SIZE as i64,
+                );
+                if ret != PAGE_SIZE as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            debug_assert!(page.get_id() == page_id, "Page id mismatch");
+            Ok(())
+        }
+
+        pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<(), std::io::Error> {
+            self.stats.inc_buffered_write();
+            log_trace!("Writing page: {} to file: {:?}", page_id, self.path);
+            debug_assert!(page.get_id() == page_id, "Page id mismatch");
+            unsafe {
+                let ret = pwrite(
+                    self.file_no,
+                    page.get_raw_bytes().as_ptr() as *const c_void,
+                    PAGE_SIZE,
+                    page_id as i64 * PAGE_SIZE as i64,
+                );
+                if ret != PAGE_SIZE as isize {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        // With psync_direct, we don't need to flush.
+        pub fn flush(&self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+}
+
+pub mod sync_direct {
+    use super::{ContainerId, FileStats};
+    #[allow(unused_imports)]
+    use crate::log;
+    use crate::log_trace;
+    use crate::page::{Page, PageId, PAGE_SIZE};
+    use libc::{c_void, lseek, read, write, O_DIRECT, SEEK_SET};
+    use std::fs::{File, OpenOptions};
+    use std::mem::MaybeUninit;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    use std::path::PathBuf;
+
+    use std::sync::Mutex;
+
+    pub struct FileManager {
+        _path: PathBuf,
+        _file: File,
+        lock: Mutex<()>,
+        stats: FileStats,
+        file_no: i32,
+    }
+
+    impl FileManager {
+        pub fn new<P: AsRef<std::path::Path>>(
+            db_dir: P,
+            c_id: ContainerId,
+        ) -> Result<Self, std::io::Error> {
+            std::fs::create_dir_all(&db_dir)?;
+            let path = db_dir.as_ref().join(format!("{}", c_id));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(O_DIRECT)
+                .open(&path)?;
+            let file_no = file.as_raw_fd();
+            Ok(FileManager {
+                _path: path,
+                _file: file,
+                lock: Mutex::new(()),
+                stats: FileStats::new(),
+                file_no,
+            })
+        }
+
+        pub fn num_pages(&self) -> usize {
+            // Allocate uninitialized memory for libc::stat
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+
+            // Call fstat with a pointer to our uninitialized stat buffer
+            let ret = unsafe { libc::fstat(self.file_no, stat.as_mut_ptr()) };
+
+            // Check for errors (fstat returns -1 on failure)
+            if ret == -1 {
+                return 0;
+            }
+
+            // Now that fstat has successfully written to the buffer,
+            // we can assume it is initialized.
+            let stat = unsafe { stat.assume_init() };
+
+            // Use the file size (st_size) from stat, then compute pages.
+            (stat.st_size as usize) / PAGE_SIZE
+        }
+
+        pub fn get_stats(&self) -> FileStats {
+            self.stats.clone()
+        }
+
+        pub fn prefetch_page(&self, _page_id: PageId) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        pub fn read_page(&self, page_id: PageId, page: &mut Page) -> Result<(), std::io::Error> {
+            self.stats.inc_direct_read();
+            log_trace!("Reading page: {} from file: {:?}", page_id, self.path);
+            let lock_result = self.lock.lock().unwrap();
+            unsafe {
+                let offset = page_id as i64 * PAGE_SIZE as i64;
+                // Seek first
+                let ret = lseek(self.file_no, offset, SEEK_SET);
+                if ret != offset {
+                    return Err(std::io::Error::last_os_error());
+                }
+
                 let ret = read(
-                    fd,
+                    self.file_no,
                     page.get_raw_bytes_mut().as_mut_ptr() as *mut c_void,
                     PAGE_SIZE,
                 );
@@ -265,6 +441,7 @@ pub mod o_direct {
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            drop(lock_result);
             // file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
             // file.read_exact(page.get_raw_bytes_mut())?;
             debug_assert!(page.get_id() == page_id, "Page id mismatch");
@@ -272,15 +449,18 @@ pub mod o_direct {
         }
 
         pub fn write_page(&self, page_id: PageId, page: &Page) -> Result<(), std::io::Error> {
-            let mut file = self.file.lock().unwrap();
-            let fd = file.as_raw_fd();
             self.stats.inc_direct_write();
             log_trace!("Writing page: {} to file: {:?}", page_id, self.path);
             debug_assert!(page.get_id() == page_id, "Page id mismatch");
-            file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
+            let lock_result = self.lock.lock().unwrap();
             unsafe {
+                let offset = page_id as i64 * PAGE_SIZE as i64;
+                let ret = lseek(self.file_no, offset, SEEK_SET);
+                if ret != offset {
+                    return Err(std::io::Error::last_os_error());
+                };
                 let ret = write(
-                    fd,
+                    self.file_no,
                     page.get_raw_bytes().as_ptr() as *const c_void,
                     PAGE_SIZE,
                 );
@@ -288,27 +468,27 @@ pub mod o_direct {
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            drop(lock_result);
             Ok(())
         }
 
-        // With O_DIRECT, we don't need to flush.
+        // With sync_direct, we don't need to flush.
         pub fn flush(&self) -> Result<(), std::io::Error> {
             Ok(())
         }
     }
 }
 
-#[cfg(feature = "async_write")]
 pub mod async_write {
-    use crate::bp::ContainerId;
+    use super::ContainerId;
     #[allow(unused_imports)]
     use crate::log;
     use crate::page::{Page, PageId, PAGE_SIZE};
-    use crate::{log_debug, log_info, log_trace};
+    use crate::{log_debug, log_trace};
     use std::cell::UnsafeCell;
     use std::fs::{File, OpenOptions};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
+
     use std::sync::Mutex;
 
     use io_uring::{opcode, types, IoUring};
@@ -380,7 +560,7 @@ pub mod async_write {
         pub fn flush(&self) -> Result<(), std::io::Error> {
             log_trace!("Flushing file: {:?}", self.path);
             let mut file_inner = self.file_inner.lock().unwrap();
-            file_inner.flush_page()
+            file_inner.flush()
         }
     }
 
@@ -779,7 +959,7 @@ pub mod async_write {
             }
         }
 
-        fn flush_page(&mut self) -> Result<(), std::io::Error> {
+        fn flush(&mut self) -> Result<(), std::io::Error> {
             // Find the first entry in the page_buffer that is not written. Wait for it to be written.
             for i in 0..PAGE_BUFFER_SIZE {
                 if !self.page_buffer_status[i] {
@@ -832,22 +1012,21 @@ pub mod async_write {
     }
 }
 
-#[cfg(feature = "new_async_write")]
 mod new_async_write {
-    use crate::bp::ContainerId;
+    use super::ContainerId;
     #[allow(unused_imports)]
     use crate::log;
     use crate::page::{Page, PageId, PAGE_SIZE};
     use crate::rwlatch::RwLatch;
-    use crate::{log_debug, log_error, log_info};
+
     use std::cell::UnsafeCell;
     use std::fs::{File, OpenOptions};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::{Condvar, Mutex, RwLock};
 
-    use io_uring::{opcode, types, CompletionQueue, IoUring, SubmissionQueue};
-    use libc::iovec;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    use io_uring::{opcode, types, IoUring};
+
     use std::hash::{Hash, Hasher};
     use std::os::unix::io::AsRawFd;
 

@@ -121,6 +121,12 @@ fn main() {
     // Parse command line arguments.
     let args: IOBench = IOBench::parse();
     println!("Page size: {} KiB", PAGE_SIZE / 1024);
+    #[cfg(feature = "sync")]
+    println!("Using sync I/O");
+    #[cfg(feature = "sync_direct")]
+    println!("Using sync direct I/O");
+    #[cfg(feature = "psync_direct")]
+    println!("Using psync direct I/O");
     println!("Arguments: {}", args);
 
     // Create (or open) the file and wrap it in an Arc.

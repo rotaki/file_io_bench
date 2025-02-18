@@ -5,7 +5,12 @@ edition = "2021"
 
 
 [features]
-default = ["o_direct"]
+default = []
+log_trace = []
+log_debug = []
+log_info = []
+log_warn = []
+log_error = []
 # Page sizes. If page sizes are larger than 256k, pages will be heap allocated to avoid stack overflow.
 # Default is 4KB (defined in page.rs)
 4k_page = []
@@ -21,13 +26,10 @@ heap_allocated_page = []
 
 stat = []
 
-psync = ["io-uring", "libc"]
-# Async IO only for write
-async_write = ["io-uring", "libc"]
-# Async IO with prefetching
-new_async_write = ["io-uring", "libc"]
-# O_DIRECT
-o_direct = ["libc"]
+psync = []
+psync_direct = [] # Default. pread/pwrite with O_DIRECT
+async_write = [] # io-uring without prefetching
+new_async_write = [] # io-uring with prefetching
 
 [dependencies]
 chrono = "0.4.39"
@@ -36,8 +38,8 @@ rand = {version = "0.9.0", features = ["small_rng"]}
 serde = { version = "1.0.217", features = ["derive"] }
 lazy_static = { version = "1.4" }
 clap = {version = "4.5.27", features = ["derive"]}
-io-uring = {version = "0.7.4", optional = true}
-libc = {version = "0.2.169", optional = true}
+io-uring = {version = "0.7.4" }
+libc = {version = "0.2.169" }
 
 [profile.release]
 lto = true
