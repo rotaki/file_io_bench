@@ -26,8 +26,11 @@ heap_allocated_page = []
 
 stat = []
 
-psync = []
-psync_direct = [] # Default. pread/pwrite with O_DIRECT
+preadpwrite_sync = [] # synchronous I/O implementation using pread/pwrite. Default
+iouring_sync = [] # synchronous I/O implementation using io-uring
+inmemory_async_simulator = [] # best case scenario for async I/O
+iouring_async = [] # asynchronous I/O implementation using io-uring
+copy_async_simulator = [] # best case scenario for async I/O
 async_write = [] # io-uring without prefetching
 new_async_write = [] # io-uring with prefetching
 
@@ -40,6 +43,7 @@ lazy_static = { version = "1.4" }
 clap = {version = "4.5.27", features = ["derive"]}
 io-uring = {version = "0.7.4" }
 libc = {version = "0.2.169" }
+dashmap = {version = "6.1.0" }
 
 [profile.release]
 lto = true

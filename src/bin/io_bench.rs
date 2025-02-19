@@ -1,18 +1,18 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
-use std::thread;
-use std::time::{Duration, Instant};
-
 use clap::Parser;
+use dashmap::DashMap;
 use file_io_bench::file_manager::FileManager;
 use file_io_bench::page::{Page, PageId, PAGE_SIZE};
 use file_io_bench::random::gen_random_int;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Clone)]
 pub struct IOBench {
     #[clap(short, long, default_value = "1")]
     num_threads: usize,
-    #[clap(short, long, default_value = "1048576")]
+    #[clap(short, long, default_value = "1024")]
     file_size: usize, // in multiples of page size
     #[clap(short, long, default_value = "10")]
     duration: u64,
@@ -117,16 +117,189 @@ pub fn per_thread_write_execution(
     }
 }
 
+/// The measured execution loop that performs only disk writes.
+/// The thread-local data (td) is used for any thread-specific data, and
+/// ts is used to update the atomic write counter.
+/// Simulate serialized writes to the same page by using a lock table.
+pub fn per_thread_write_execution_with_lock(
+    flag: &AtomicBool,
+    args: &IOBench,
+    file: &FileManager,
+    td: &mut ThreadLocalData,
+    ts: &ThreadLocalStats,
+    lock_table: &DashMap<PageId, Mutex<()>>,
+) {
+    // This loop is the measured part: performing disk writes.
+    while !flag.load(Ordering::Relaxed) {
+        // Choose a random page ID.
+        let page_id = (gen_random_int(0, args.file_size as PageId - 1)) as PageId;
+        let lock = lock_table.entry(page_id).or_insert(Mutex::new(()));
+        let _guard = lock.lock().unwrap();
+        {
+            td.page.set_id(page_id);
+            // Write the page to disk.
+            file.write_page(page_id as PageId, &td.page).unwrap();
+        }
+        drop(_guard);
+        // Update the thread's write counter atomically.
+        ts.write_count.fetch_add(1, Ordering::Relaxed);
+        // Sleep a bit to avoid saturating the system.
+        // thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// ---------- Benchmark runner helper ----------
+
+/// Runs a benchmark given a worker closure. The closure is executed by each thread
+/// after a barrier is passed. It should perform the measured work (i.e. one of our two loops).
+fn run_benchmark(
+    args: &IOBench,
+    file: Arc<FileManager>,
+    worker: Arc<
+        dyn Fn(
+                &AtomicBool,
+                &IOBench,
+                &Arc<FileManager>,
+                &mut ThreadLocalData,
+                &Arc<ThreadLocalStats>,
+            ) + Send
+            + Sync,
+    >,
+) {
+    let barrier = Arc::new(Barrier::new(args.num_threads));
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut stats_vec = Vec::new();
+    let mut handles = Vec::new();
+
+    // Spawn worker threads.
+    for i in 0..args.num_threads {
+        let barrier_clone = Arc::clone(&barrier);
+        let flag_clone = Arc::clone(&flag);
+        let args_clone = args.clone();
+        let file_clone = Arc::clone(&file);
+        let ts = Arc::new(ThreadLocalStats {
+            thread_id: i,
+            write_count: AtomicUsize::new(0),
+        });
+        stats_vec.push(Arc::clone(&ts));
+
+        let worker_clone = Arc::clone(&worker);
+        let handle = thread::spawn(move || {
+            // Phase 1: Thread-local initialization (not measured)
+            let mut td = ThreadLocalData::new(i);
+            // Wait until all threads are ready.
+            barrier_clone.wait();
+            // Phase 2: Execute the measured loop.
+            worker_clone(&flag_clone, &args_clone, &file_clone, &mut td, &ts);
+        });
+        handles.push(handle);
+    }
+
+    // Measurement: Print bandwidth every 2 seconds.
+    let measurement_duration = Duration::from_secs(args.duration);
+    let measurement_interval = Duration::from_secs(2);
+    let page_size = 4096; // in bytes
+    let start_time = Instant::now();
+    let mut last_total_writes = 0;
+
+    while start_time.elapsed() < measurement_duration {
+        thread::sleep(measurement_interval);
+
+        // Sum up the total writes from all threads.
+        let total_writes: usize = stats_vec
+            .iter()
+            .map(|ts| ts.write_count.load(Ordering::Relaxed))
+            .sum();
+        let delta_writes = total_writes - last_total_writes;
+        last_total_writes = total_writes;
+        // Calculate bandwidth (bytes/sec).
+        let bandwidth = (delta_writes * page_size) as f64 / measurement_interval.as_secs_f64();
+        println!(
+            "Current bandwidth: {:.2} MiB/sec ({} IOPS)",
+            bandwidth / 1024.0 / 1024.0,
+            delta_writes
+        );
+    }
+
+    // Signal threads to stop.
+    flag.store(true, Ordering::Relaxed);
+
+    // Wait for all threads to finish.
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Print final total writes and bandwidth.
+    let total_writes: usize = stats_vec
+        .iter()
+        .map(|ts| ts.write_count.load(Ordering::Relaxed))
+        .sum();
+    println!("Final total writes = {}", total_writes);
+    println!(
+        "Final bandwidth = {:.2} MiB/sec",
+        (total_writes * page_size) as f64 / 1024.0 / 1024.0 / args.duration as f64
+    );
+}
+
+// ---------- Main function ----------
+
+fn main() {
+    // Parse command line arguments.
+    let args: IOBench = IOBench::parse();
+    println!("Page size: {} KiB", 4096 / 1024);
+    println!("Arguments: {}", args);
+
+    // Create (or open) the file and wrap it in an Arc.
+    let file = Arc::new(FileManager::new(".", 0).unwrap());
+
+    // Initialize the file on disk (this work is not measured).
+    initialize_file(args.file_size, &file, 4);
+
+    // ---------- Run benchmark without lock ----------
+    println!("=== Running unlocked benchmark ===");
+    let unlocked_worker = Arc::new(
+        move |flag: &AtomicBool,
+              args: &IOBench,
+              file: &Arc<FileManager>,
+              td: &mut ThreadLocalData,
+              ts: &Arc<ThreadLocalStats>| {
+            per_thread_write_execution(flag, args, file, td, ts);
+        },
+    );
+    run_benchmark(&args, Arc::clone(&file), unlocked_worker);
+
+    // ---------- Run benchmark with lock ----------
+    println!("=== Running locked benchmark ===");
+    // Create a shared lock table.
+    let lock_table = Arc::new(DashMap::<PageId, Mutex<()>>::new());
+    let locked_worker = {
+        let lock_table = Arc::clone(&lock_table);
+        Arc::new(
+            move |flag: &AtomicBool,
+                  args: &IOBench,
+                  file: &Arc<FileManager>,
+                  td: &mut ThreadLocalData,
+                  ts: &Arc<ThreadLocalStats>| {
+                per_thread_write_execution_with_lock(flag, args, file, td, ts, &lock_table);
+            },
+        )
+    };
+    run_benchmark(&args, file, locked_worker);
+}
+
+/*
 fn main() {
     // Parse command line arguments.
     let args: IOBench = IOBench::parse();
     println!("Page size: {} KiB", PAGE_SIZE / 1024);
-    #[cfg(feature = "sync")]
-    println!("Using sync I/O");
-    #[cfg(feature = "sync_direct")]
-    println!("Using sync direct I/O");
-    #[cfg(feature = "psync_direct")]
-    println!("Using psync direct I/O");
+    #[cfg(feature = "preadpwrite_sync")]
+    println!("Synchronous I/O using pread/pwrite");
+    #[cfg(feature = "iouring_sync")]
+    println!("Synchronous I/O using io_uring");
+    #[cfg(feature = "iouring_async")]
+    println!("Asynchronous I/O using io_uring");
+    #[cfg(feature = "async_write")]
+    println!("Using async write");
     println!("Arguments: {}", args);
 
     // Create (or open) the file and wrap it in an Arc.
@@ -217,3 +390,4 @@ fn main() {
         (total_writes * page_size) as f64 / 1024.0 / 1024.0 / args.duration as f64
     );
 }
+*/
