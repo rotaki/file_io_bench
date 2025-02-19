@@ -3,7 +3,8 @@ use dashmap::DashMap;
 use file_io_bench::file_manager::FileManager;
 use file_io_bench::page::{Page, PageId, PAGE_SIZE};
 use file_io_bench::random::gen_random_int;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::arch::x86_64::__rdtscp;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,6 +47,7 @@ impl ThreadLocalData {
 pub struct ThreadLocalStats {
     pub thread_id: usize,
     pub write_count: AtomicUsize,
+    pub total_cpu_cycles: AtomicU64,
 }
 
 /// Initializes the file by writing one page per index in parallel.
@@ -109,9 +111,14 @@ pub fn per_thread_write_execution(
         let page_id = (gen_random_int(0, args.file_size as PageId - 1)) as PageId;
         td.page.set_id(page_id);
         // Write the page to disk.
+        let mut aux: u32 = 0;
+        let start = unsafe { __rdtscp(&mut aux) };
         file.write_page(page_id as PageId, &td.page).unwrap();
+        let end = unsafe { __rdtscp(&mut aux) };
         // Update the thread's write counter atomically.
         ts.write_count.fetch_add(1, Ordering::Relaxed);
+        ts.total_cpu_cycles
+            .fetch_add(end - start, Ordering::Relaxed);
         // Sleep a bit to avoid saturating the system.
         // thread::sleep(Duration::from_millis(10));
     }
@@ -135,15 +142,20 @@ pub fn per_thread_write_execution_with_lock(
         let page_id = (gen_random_int(0, args.file_size as PageId - 1)) as PageId;
         let lock = lock_table.entry(page_id).or_insert(Mutex::new(()));
         let _guard = lock.lock().unwrap();
-        {
+        let cpu_cycles = {
             td.page.set_id(page_id);
+            let mut aux: u32 = 0;
+            let start = unsafe { __rdtscp(&mut aux) };
             // Write the page to disk.
             file.write_page(page_id as PageId, &td.page).unwrap();
-        }
+            let end = unsafe { __rdtscp(&mut aux) };
+            end - start
+        };
         drop(_guard);
         // Update the thread's write counter atomically.
         ts.write_count.fetch_add(1, Ordering::Relaxed);
         // Sleep a bit to avoid saturating the system.
+        ts.total_cpu_cycles.fetch_add(cpu_cycles, Ordering::Relaxed);
         // thread::sleep(Duration::from_millis(10));
     }
 }
@@ -180,6 +192,7 @@ fn run_benchmark(
         let ts = Arc::new(ThreadLocalStats {
             thread_id: i,
             write_count: AtomicUsize::new(0),
+            total_cpu_cycles: AtomicU64::new(0),
         });
         stats_vec.push(Arc::clone(&ts));
 
@@ -198,9 +211,10 @@ fn run_benchmark(
     // Measurement: Print bandwidth every 2 seconds.
     let measurement_duration = Duration::from_secs(args.duration);
     let measurement_interval = Duration::from_secs(2);
-    let page_size = 4096; // in bytes
+    let page_size = PAGE_SIZE; // in bytes
     let start_time = Instant::now();
     let mut last_total_writes = 0;
+    let mut last_total_cpu_cycles = 0;
 
     while start_time.elapsed() < measurement_duration {
         thread::sleep(measurement_interval);
@@ -210,14 +224,21 @@ fn run_benchmark(
             .iter()
             .map(|ts| ts.write_count.load(Ordering::Relaxed))
             .sum();
+        let total_cpu_cycles: u64 = stats_vec
+            .iter()
+            .map(|ts| ts.total_cpu_cycles.load(Ordering::Relaxed))
+            .sum();
         let delta_writes = total_writes - last_total_writes;
+        let delta_cpu_cycles = total_cpu_cycles - last_total_cpu_cycles;
         last_total_writes = total_writes;
+        last_total_cpu_cycles = total_cpu_cycles;
         // Calculate bandwidth (bytes/sec).
         let bandwidth = (delta_writes * page_size) as f64 / measurement_interval.as_secs_f64();
         println!(
-            "Current bandwidth: {:.2} MiB/sec ({} IOPS)",
+            "Current bandwidth: {:.2} MiB/sec ({:.2} IOPS, {:.2} CPU cycles per IO)",
             bandwidth / 1024.0 / 1024.0,
-            delta_writes
+            delta_writes as f64 / measurement_interval.as_secs_f64(),
+            delta_cpu_cycles as f64 / delta_writes as f64,
         );
     }
 
@@ -236,8 +257,9 @@ fn run_benchmark(
         .sum();
     println!("Final total writes = {}", total_writes);
     println!(
-        "Final bandwidth = {:.2} MiB/sec",
-        (total_writes * page_size) as f64 / 1024.0 / 1024.0 / args.duration as f64
+        "Final bandwidth = {:.2} MiB/sec ({:.2} IOPS)",
+        (total_writes * page_size) as f64 / 1024.0 / 1024.0 / args.duration as f64,
+        total_writes as f64 / args.duration as f64,
     );
 }
 
