@@ -1,2 +1,5 @@
 /target
 0
+iouring_async
+iouring_sync
+preadpwrite_sync

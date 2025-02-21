@@ -3,7 +3,12 @@ use dashmap::DashMap;
 use file_io_bench::file_manager::FileManager;
 use file_io_bench::page::{Page, PageId, PAGE_SIZE};
 use file_io_bench::random::gen_random_int;
-use std::arch::x86_64::__rdtscp;
+#[cfg(target_os = "linux")]
+use libc::{cpu_set_t, sched_setaffinity};
+use std::arch::{asm, x86_64::__rdtscp};
+use std::hint::black_box;
+use std::io;
+use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
@@ -17,14 +22,18 @@ pub struct IOBench {
     file_size: usize, // in multiples of page size
     #[clap(short, long, default_value = "10")]
     duration: u64,
+    #[clap(short = 'o', long, default_value = "0")]
+    num_cpu_operations: usize,
+    #[clap(long, default_value = "true")]
+    pin_cpu: bool,
 }
 
 impl std::fmt::Display for IOBench {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "IOBench {{ num_threads: {}, file_size: {}, duration: {} }}",
-            self.num_threads, self.file_size, self.duration
+            "IOBench {{ num_threads: {}, file_size: {}, duration: {}, num_nop: {}, pin_cpu: {} }}",
+            self.num_threads, self.file_size, self.duration, self.num_cpu_operations, self.pin_cpu
         )
     }
 }
@@ -47,6 +56,7 @@ impl ThreadLocalData {
 pub struct ThreadLocalStats {
     pub thread_id: usize,
     pub write_count: AtomicUsize,
+    pub write_cpu_cycles: AtomicU64,
     pub total_cpu_cycles: AtomicU64,
 }
 
@@ -95,6 +105,15 @@ pub fn initialize_file(file_size: usize, file: &Arc<FileManager>, num_threads: u
     println!("File initialized.");
 }
 
+fn add_cpu_work(num_cpu_operations: usize) {
+    let mut value: u64 = 1;
+    for _ in 0..num_cpu_operations {
+        // Each multiplication depends on the previous result.
+        value = value.wrapping_mul(3);
+    }
+    black_box(value);
+}
+
 /// The measured execution loop that performs only disk writes.
 /// The thread-local data (td) is used for any thread-specific data, and
 /// ts is used to update the atomic write counter.
@@ -107,7 +126,8 @@ pub fn per_thread_write_execution(
 ) {
     // This loop is the measured part: performing disk writes.
     while !flag.load(Ordering::Relaxed) {
-        // Choose a random page ID.
+        let mut total_aux: u32 = 0;
+        let total_start = unsafe { __rdtscp(&mut total_aux) };
         let page_id = (gen_random_int(0, args.file_size as PageId - 1)) as PageId;
         td.page.set_id(page_id);
         // Write the page to disk.
@@ -115,12 +135,14 @@ pub fn per_thread_write_execution(
         let start = unsafe { __rdtscp(&mut aux) };
         file.write_page(page_id as PageId, &td.page).unwrap();
         let end = unsafe { __rdtscp(&mut aux) };
-        // Update the thread's write counter atomically.
+        add_cpu_work(args.num_cpu_operations);
+        let total_end = unsafe { __rdtscp(&mut total_aux) };
+
         ts.write_count.fetch_add(1, Ordering::Relaxed);
-        ts.total_cpu_cycles
+        ts.write_cpu_cycles
             .fetch_add(end - start, Ordering::Relaxed);
-        // Sleep a bit to avoid saturating the system.
-        // thread::sleep(Duration::from_millis(10));
+        ts.total_cpu_cycles
+            .fetch_add(total_end - total_start, Ordering::Relaxed);
     }
 }
 
@@ -138,7 +160,8 @@ pub fn per_thread_write_execution_with_lock(
 ) {
     // This loop is the measured part: performing disk writes.
     while !flag.load(Ordering::Relaxed) {
-        // Choose a random page ID.
+        let mut total_aux: u32 = 0;
+        let total_start = unsafe { __rdtscp(&mut total_aux) };
         let page_id = (gen_random_int(0, args.file_size as PageId - 1)) as PageId;
         let lock = lock_table.entry(page_id).or_insert(Mutex::new(()));
         let _guard = lock.lock().unwrap();
@@ -152,12 +175,40 @@ pub fn per_thread_write_execution_with_lock(
             end - start
         };
         drop(_guard);
-        // Update the thread's write counter atomically.
+        add_cpu_work(args.num_cpu_operations);
+        let total_end = unsafe { __rdtscp(&mut total_aux) };
+
         ts.write_count.fetch_add(1, Ordering::Relaxed);
-        // Sleep a bit to avoid saturating the system.
-        ts.total_cpu_cycles.fetch_add(cpu_cycles, Ordering::Relaxed);
-        // thread::sleep(Duration::from_millis(10));
+        ts.write_cpu_cycles.fetch_add(cpu_cycles, Ordering::Relaxed);
+        ts.total_cpu_cycles
+            .fetch_add(total_end - total_start, Ordering::Relaxed);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn set_affinity(cpu_id: usize) -> io::Result<()> {
+    use libc::{CPU_SET, CPU_ZERO};
+
+    unsafe {
+        // Create a CPU set and clear it.
+        let mut cpuset: cpu_set_t = mem::zeroed();
+        CPU_ZERO(&mut cpuset);
+        CPU_SET(cpu_id, &mut cpuset);
+
+        // Set affinity of the current thread (pid 0 means current process/thread)
+        let ret = sched_setaffinity(0, mem::size_of::<cpu_set_t>(), &cpuset);
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn get_current_cpu() -> i32 {
+    use libc::{sched_getcpu, CPU_SETSIZE};
+
+    unsafe { sched_getcpu() % CPU_SETSIZE }
 }
 
 // ---------- Benchmark runner helper ----------
@@ -178,10 +229,23 @@ fn run_benchmark(
             + Sync,
     >,
 ) {
+    let num_cores = std::thread::available_parallelism().unwrap().get();
     let barrier = Arc::new(Barrier::new(args.num_threads));
     let flag = Arc::new(AtomicBool::new(false));
     let mut stats_vec = Vec::new();
     let mut handles = Vec::new();
+
+    // Pin the current thread to a core.
+    #[cfg(target_os = "linux")]
+    {
+        set_affinity(args.num_threads).unwrap();
+        let current_cpu = get_current_cpu();
+        println!("Main thread pinned to CPU {}", current_cpu);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        println!("Main thread not pinned to CPU");
+    }
 
     // Spawn worker threads.
     for i in 0..args.num_threads {
@@ -192,6 +256,7 @@ fn run_benchmark(
         let ts = Arc::new(ThreadLocalStats {
             thread_id: i,
             write_count: AtomicUsize::new(0),
+            write_cpu_cycles: AtomicU64::new(0),
             total_cpu_cycles: AtomicU64::new(0),
         });
         stats_vec.push(Arc::clone(&ts));
@@ -200,6 +265,23 @@ fn run_benchmark(
         let handle = thread::spawn(move || {
             // Phase 1: Thread-local initialization (not measured)
             let mut td = ThreadLocalData::new(i);
+
+            // Phase 2: Pin thread to a core.
+            if args_clone.pin_cpu {
+                #[cfg(target_os = "linux")]
+                {
+                    set_affinity(i % num_cores).unwrap();
+                    let current_cpu = get_current_cpu();
+                    println!("Thread {} pinned to CPU {}", i, current_cpu);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    println!("Thread {} not pinned to CPU", i);
+                }
+            } else {
+                println!("Thread {} not pinned to CPU", i);
+            }
+
             // Wait until all threads are ready.
             barrier_clone.wait();
             // Phase 2: Execute the measured loop.
@@ -214,6 +296,7 @@ fn run_benchmark(
     let page_size = PAGE_SIZE; // in bytes
     let start_time = Instant::now();
     let mut last_total_writes = 0;
+    let mut last_write_cpu_cycles = 0;
     let mut last_total_cpu_cycles = 0;
 
     while start_time.elapsed() < measurement_duration {
@@ -224,21 +307,29 @@ fn run_benchmark(
             .iter()
             .map(|ts| ts.write_count.load(Ordering::Relaxed))
             .sum();
+        let write_cpu_cycles: u64 = stats_vec
+            .iter()
+            .map(|ts| ts.write_cpu_cycles.load(Ordering::Relaxed))
+            .sum();
         let total_cpu_cycles: u64 = stats_vec
             .iter()
             .map(|ts| ts.total_cpu_cycles.load(Ordering::Relaxed))
             .sum();
         let delta_writes = total_writes - last_total_writes;
-        let delta_cpu_cycles = total_cpu_cycles - last_total_cpu_cycles;
+        let delta_write_cpu_cycles = write_cpu_cycles - last_write_cpu_cycles;
+        let delta_total_cpu_cycles = total_cpu_cycles - last_total_cpu_cycles;
+
         last_total_writes = total_writes;
+        last_write_cpu_cycles = write_cpu_cycles;
         last_total_cpu_cycles = total_cpu_cycles;
         // Calculate bandwidth (bytes/sec).
         let bandwidth = (delta_writes * page_size) as f64 / measurement_interval.as_secs_f64();
         println!(
-            "Current bandwidth: {:.2} MiB/sec ({:.2} IOPS, {:.2} CPU cycles per IO)",
+            "Current bandwidth: {:.2} MiB/sec ({:.2} IOPS, {:.2} CPU cycles per IO, {:.2} CPU cycles per operation)",
             bandwidth / 1024.0 / 1024.0,
             delta_writes as f64 / measurement_interval.as_secs_f64(),
-            delta_cpu_cycles as f64 / delta_writes as f64,
+            delta_write_cpu_cycles as f64 / delta_writes as f64 / args.num_threads as f64,
+            delta_total_cpu_cycles as f64 / delta_writes as f64 / args.num_threads as f64,
         );
     }
 
@@ -255,11 +346,21 @@ fn run_benchmark(
         .iter()
         .map(|ts| ts.write_count.load(Ordering::Relaxed))
         .sum();
+    let write_cpu_cycles: u64 = stats_vec
+        .iter()
+        .map(|ts| ts.write_cpu_cycles.load(Ordering::Relaxed))
+        .sum();
+    let total_cpu_cycles: u64 = stats_vec
+        .iter()
+        .map(|ts| ts.total_cpu_cycles.load(Ordering::Relaxed))
+        .sum();
     println!("Final total writes = {}", total_writes);
     println!(
-        "Final bandwidth = {:.2} MiB/sec ({:.2} IOPS)",
+        "Final bandwidth = {:.2} MiB/sec ({:.2} IOPS, {:.2} CPU cycles per IO, {:.2} CPU cycles per operation)",
         (total_writes * page_size) as f64 / 1024.0 / 1024.0 / args.duration as f64,
         total_writes as f64 / args.duration as f64,
+        write_cpu_cycles as f64 / total_writes as f64 / args.num_threads as f64,
+        total_cpu_cycles as f64 / total_writes as f64 / args.num_threads as f64,
     );
 }
 
@@ -268,6 +369,14 @@ fn run_benchmark(
 fn main() {
     // Parse command line arguments.
     let args: IOBench = IOBench::parse();
+
+    #[cfg(feature = "preadpwrite_sync")]
+    println!("Synchronous I/O using pread/pwrite");
+    #[cfg(feature = "iouring_sync")]
+    println!("Synchronous I/O using io_uring");
+    #[cfg(feature = "iouring_async")]
+    println!("Asynchronous I/O using io_uring");
+
     println!("Page size: {} KiB", 4096 / 1024);
     println!("Arguments: {}", args);
 
@@ -278,7 +387,7 @@ fn main() {
     initialize_file(args.file_size, &file, 4);
 
     // ---------- Run benchmark without lock ----------
-    println!("=== Running unlocked benchmark ===");
+    // println!("=== Running unlocked benchmark ===");
     let unlocked_worker = Arc::new(
         move |flag: &AtomicBool,
               args: &IOBench,
@@ -291,22 +400,22 @@ fn main() {
     run_benchmark(&args, Arc::clone(&file), unlocked_worker);
 
     // ---------- Run benchmark with lock ----------
-    println!("=== Running locked benchmark ===");
-    // Create a shared lock table.
-    let lock_table = Arc::new(DashMap::<PageId, Mutex<()>>::new());
-    let locked_worker = {
-        let lock_table = Arc::clone(&lock_table);
-        Arc::new(
-            move |flag: &AtomicBool,
-                  args: &IOBench,
-                  file: &Arc<FileManager>,
-                  td: &mut ThreadLocalData,
-                  ts: &Arc<ThreadLocalStats>| {
-                per_thread_write_execution_with_lock(flag, args, file, td, ts, &lock_table);
-            },
-        )
-    };
-    run_benchmark(&args, file, locked_worker);
+    // println!("=== Running locked benchmark ===");
+    // // Create a shared lock table.
+    // let lock_table = Arc::new(DashMap::<PageId, Mutex<()>>::new());
+    // let locked_worker = {
+    //     let lock_table = Arc::clone(&lock_table);
+    //     Arc::new(
+    //         move |flag: &AtomicBool,
+    //               args: &IOBench,
+    //               file: &Arc<FileManager>,
+    //               td: &mut ThreadLocalData,
+    //               ts: &Arc<ThreadLocalStats>| {
+    //             per_thread_write_execution_with_lock(flag, args, file, td, ts, &lock_table);
+    //         },
+    //     )
+    // };
+    // run_benchmark(&args, file, locked_worker);
 }
 
 /*

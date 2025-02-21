@@ -5,11 +5,7 @@ pub type ContainerId = u16;
 #[cfg(not(any(
     feature = "preadpwrite_sync",
     feature = "iouring_sync",
-    feature = "inmemory_async_simulator",
-    feature = "copy_async_simulator",
     feature = "iouring_async",
-    feature = "async_write",
-    feature = "new_async_write",
 )))]
 pub type FileManager = preadpwrite_sync::FileManager;
 
@@ -17,16 +13,8 @@ pub type FileManager = preadpwrite_sync::FileManager;
 pub type FileManager = preadpwrite_sync::FileManager;
 #[cfg(feature = "iouring_sync")]
 pub type FileManager = iouring_sync::FileManager;
-#[cfg(feature = "inmemory_async_simulator")]
-pub type FileManager = inmemory_async_simulator::FileManager;
-#[cfg(feature = "copy_async_simulator")]
-pub type FileManager = copy_async_simulator::FileManager;
 #[cfg(feature = "iouring_async")]
 pub type FileManager = iouring_async::FileManager;
-#[cfg(feature = "async_write")]
-pub type FileManager = async_write::FileManager;
-#[cfg(feature = "new_async_write")]
-pub type FileManager = new_async_write::FileManager;
 
 pub struct FileStats {
     pub buffered_read_count: AtomicU32,
@@ -909,7 +897,7 @@ pub mod iouring_async {
     // Static per hash ring
     static RINGS: OnceLock<Vec<PerPageHashRing>> = OnceLock::new();
 
-    const NUM_RINGS: usize = 10;
+    const NUM_RINGS: usize = 128;
 
     pub struct GlobalRing {}
 
